@@ -1,0 +1,19 @@
+services:
+  lighting-cue:
+    build: .
+    image: lighting-cue-rehearsal:latest
+    container_name: lighting-cue-rehearsal
+    ports:
+      - "${HOST_PORT:-3000}:3000"
+    environment:
+      # 容器内监听端口（修改后需同步调整左侧映射）
+      PORT: 3000
+      # SQLite 数据库文件位置（位于挂载卷内，重建容器不丢数据）
+      DB_PATH: /data/app.db
+      NODE_ENV: production
+    volumes:
+      - cue-data:/data
+    restart: unless-stopped
+
+volumes:
+  cue-data:

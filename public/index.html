@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>小剧场灯光 Cue 排演</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>🎭 小剧场灯光 Cue 排演</h1>
+    <nav class="tabs">
+      <button class="tab active" data-tab="player">排演播放</button>
+      <button class="tab" data-tab="rooms">共享房间</button>
+      <button class="tab" data-tab="records">调光记录</button>
+      <button class="tab" data-tab="compare">版本比对</button>
+      <button class="tab" data-tab="load">回路负载</button>
+      <button class="tab" data-tab="lights">灯具录入</button>
+      <button class="tab" data-tab="cues">草稿 Cue</button>
+      <button class="tab" data-tab="publish">发布版本</button>
+      <button class="tab" data-tab="merge">版本合并</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ============================ 播放器 ============================ -->
+    <section id="tab-player" class="tab-panel active">
+      <div class="player-controls card">
+        <div class="row">
+          <label>演出版本：
+            <select id="version-select">
+              <option value="">— 请先发布一个版本 —</option>
+            </select>
+          </label>
+          <span id="session-info" class="muted"></span>
+        </div>
+        <div class="row transport">
+          <button id="btn-play" class="primary">▶ 播放</button>
+          <button id="btn-pause">⏸ 暂停</button>
+          <button id="btn-stop">⏹ 回到起点</button>
+          <label class="speed">速度
+            <select id="play-speed">
+              <option value="0.5">0.5×</option>
+              <option value="1" selected>1×</option>
+              <option value="2">2×</option>
+            </select>
+          </label>
+          <span class="time-readout"><b id="time-current">0.0</b> / <span id="time-total">0.0</span> s</span>
+          <label class="jump">跳转到
+            <input id="jump-time" type="number" min="0" step="0.1" style="width:5.5rem" /> 秒
+          </label>
+          <button id="btn-jump">跳转</button>
+        </div>
+        <div class="row">
+          <input id="timeline" type="range" min="0" max="0" step="0.01" value="0" style="flex:1" />
+        </div>
+        <div id="player-error" class="error-line" hidden></div>
+      </div>
+
+      <div class="card">
+        <h2>舞台模拟（当前各灯实际亮度）</h2>
+        <div id="stage" class="stage"></div>
+      </div>
+
+      <div class="card">
+        <h2>各灯亮度</h2>
+        <div id="levels" class="levels"></div>
+      </div>
+
+      <div class="card">
+        <h2>Cue 时间线</h2>
+        <div class="table-wrap">
+          <table id="cue-timeline">
+            <thead>
+              <tr><th>Cue 编号</th><th>灯具</th><th>触发 (s)</th><th>目标亮度</th><th>渐变 (s)</th><th>状态</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ 共享房间 ============================ -->
+    <section id="tab-rooms" class="tab-panel">
+      <div class="card">
+        <h2>创建共享房间</h2>
+        <p class="muted">
+          基于一个<strong>已发布版本</strong>创建共享房间。创建后房间<strong>固定该版本快照</strong>，
+          你将取得<strong>控制密钥</strong>（仅本次显示，请妥善保存）；其他人凭 6 位<strong>房间码</strong>
+          加入观看同一舞台与逐灯亮度。服务端按时间推算当前时码，到版本末尾<strong>自动停住</strong>；
+          页面刷新、服务重启或观看者重连后均能恢复房间进度，后续草稿修改与新版本发布不影响本房间。
+        </p>
+        <form id="form-room-create" class="inline-form">
+          <select id="room-version" required style="min-width:16rem"></select>
+          <button class="primary" type="submit">🎟 创建共享房间</button>
+        </form>
+        <div id="room-create-error" class="error-line" hidden></div>
+      </div>
+
+      <div class="card">
+        <h2>加入房间（凭房间码观看）</h2>
+        <form id="form-room-join" class="inline-form">
+          <input type="text" id="room-join-code" maxlength="6" placeholder="6 位房间码，如：K7QP2M"
+            style="max-width:14rem;text-transform:uppercase" />
+          <input type="text" id="room-join-key" placeholder="控制密钥（仅创建者填写，观看者留空）" />
+          <button class="primary" type="submit">🚪 加入房间</button>
+        </form>
+        <div id="room-join-error" class="error-line" hidden></div>
+
+        <h3>已有房间</h3>
+        <div class="table-wrap">
+          <table id="room-table">
+            <thead><tr><th>房间码</th><th>固定版本</th><th>状态</th><th>当前时码</th><th>速度</th><th>修订号</th><th>创建时间</th><th>操作</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="room-workspace" hidden>
+        <div class="card">
+          <div class="row" style="justify-content:space-between">
+            <h2 id="room-title" style="margin:0">房间</h2>
+            <button id="btn-room-leave">离开房间</button>
+          </div>
+          <p class="muted" id="room-meta"></p>
+          <div class="row">
+            <span class="copy-field">房间码 <code id="room-code-text"></code></span>
+            <button id="btn-copy-code">复制房间码</button>
+            <span id="room-key-area" hidden>
+              <span class="copy-field">控制密钥 <code id="room-key-text"></code></span>
+              <button id="btn-copy-key">复制密钥 / 邀请链接</button>
+            </span>
+          </div>
+          <div class="row transport">
+            <button id="btn-room-play" class="primary">▶ 播放</button>
+            <button id="btn-room-pause">⏸ 暂停</button>
+            <button id="btn-room-stop">⏹ 回到起点</button>
+            <label class="speed">速度
+              <select id="room-speed">
+                <option value="0.5">0.5×</option>
+                <option value="1">1×</option>
+                <option value="2">2×</option>
+              </select>
+            </label>
+            <span class="time-readout"><b id="room-time-current">0.0</b> / <span id="room-time-total">0.0</span> s</span>
+            <label class="jump">跳转到
+              <input id="room-jump-time" type="number" min="0" step="0.1" style="width:5.5rem" /> 秒
+            </label>
+            <button id="btn-room-jump">跳转</button>
+          </div>
+          <div class="row">
+            <input id="room-timeline" type="range" min="0" max="0" step="0.01" value="0" style="flex:1" />
+          </div>
+          <p class="muted" id="room-role-hint"></p>
+          <div id="room-control-error" class="error-line" hidden></div>
+        </div>
+
+        <div class="card">
+          <h2>舞台模拟（房间同步：当前各灯实际亮度）</h2>
+          <div id="room-stage" class="stage"></div>
+        </div>
+
+        <div class="card">
+          <h2>各灯亮度</h2>
+          <div id="room-levels" class="levels"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ 版本比对 ============================ -->
+    <section id="tab-compare" class="tab-panel">
+      <div class="card">
+        <h2>两版亮度差异比对</h2>
+        <p class="muted">
+          选择两个<strong>已发布版本</strong>（可以相同），给定非负时窗起点/终点、时窗内的查看时刻与
+          0～100 的亮度差阈值。页面显示查看时刻两版逐灯亮度，并精确列出时窗内各灯亮度差
+          <strong>严格大于</strong>阈值的连续区间及端点包含性；仅在一版存在的灯具单列为配置差异，
+          缺失不当作熄灭。比较只读发布快照，不影响草稿与播放会话。
+        </p>
+        <form id="form-compare" class="cue-form">
+          <label>版本 A
+            <select id="cmp-version-a" required></select>
+          </label>
+          <label>版本 B
+            <select id="cmp-version-b" required></select>
+          </label>
+          <label>时窗起点 (s) <input type="number" id="cmp-start" min="0" step="0.1" value="0" required /></label>
+          <label>时窗终点 (s) <input type="number" id="cmp-end" min="0" step="0.1" value="10" required /></label>
+          <label>查看时刻 (s) <input type="number" id="cmp-at" min="0" step="0.1" value="0" required /></label>
+          <label>亮度差阈值 <input type="number" id="cmp-threshold" min="0" max="100" step="0.1" value="10" required /></label>
+          <button class="primary" type="submit">开始比对</button>
+        </form>
+        <div id="compare-error" class="error-line" hidden></div>
+      </div>
+
+      <div id="compare-result" hidden>
+        <div class="card">
+          <h2 id="cmp-at-title">查看时刻逐灯亮度</h2>
+          <div class="table-wrap">
+            <table id="cmp-levels">
+              <thead>
+                <tr><th>灯具</th><th>版本 A 亮度</th><th>版本 B 亮度</th><th>亮度差</th><th>是否超阈值</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>亮度差严格大于阈值的连续区间</h2>
+          <p class="muted" id="cmp-window-note"></p>
+          <div class="table-wrap">
+            <table id="cmp-intervals">
+              <thead>
+                <tr><th>灯具</th><th>区间（秒，[含 / (不含）</th><th>数量</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p id="cmp-no-diff" class="muted" hidden>时窗内没有任何灯具的亮度差严格大于阈值（空区间）。</p>
+        </div>
+
+        <div class="card">
+          <h2>配置差异（仅在一版存在的灯具，不视为熄灭）</h2>
+          <div id="cmp-config"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ 回路负载 ============================ -->
+    <section id="tab-load" class="tab-panel">
+      <div class="card">
+        <h2>回路超载预判</h2>
+        <p class="muted">
+          选择一个<strong>已发布版本</strong>，或选择<strong>绑定它的临时调光记录</strong>（实际输出含覆盖/归还）。
+          给定非负时窗起点/终点与窗内查看时刻，系统按每盏灯<strong>实际亮度 ÷ 100 × 额定瓦数</strong>
+          汇总到所属回路，返回查看时刻各回路负载，并精确列出时窗内负载<strong>严格大于</strong>回路容量的
+          全部连续区间（<code>[ ]</code> 含端点、<code>( )</code> 不含端点）。未分配回路的灯具不计入负载；
+          发布早于回路功能的旧版本无回路配置、不产生负载。分析全程只读，不改动草稿、版本、记录与播放。
+        </p>
+        <form id="form-load" class="cue-form">
+          <label>分析对象
+            <select id="load-target-type">
+              <option value="version">已发布版本</option>
+              <option value="record">临时调光记录</option>
+            </select>
+          </label>
+          <label id="load-version-wrap">版本
+            <select id="load-version" required></select>
+          </label>
+          <label id="load-record-wrap" hidden>调光记录
+            <select id="load-record" required></select>
+          </label>
+          <label>时窗起点 (s) <input type="number" id="load-start" min="0" step="0.1" value="0" required /></label>
+          <label>时窗终点 (s) <input type="number" id="load-end" min="0" step="0.1" value="10" required /></label>
+          <label>查看时刻 (s) <input type="number" id="load-at" min="0" step="0.1" value="0" required /></label>
+          <button class="primary" type="submit">分析回路负载</button>
+        </form>
+        <div id="load-error" class="error-line" hidden></div>
+      </div>
+
+      <div id="load-result" hidden>
+        <div class="card">
+          <h2 id="load-at-title">查看时刻回路负载</h2>
+          <p class="muted" id="load-window-note"></p>
+          <div class="table-wrap">
+            <table id="load-table">
+              <thead>
+                <tr><th>回路</th><th>容量 (W)</th><th>当前负载 (W)</th><th>余量 (W)</th><th>状态</th><th>成员灯具</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>严格超出容量的连续区间</h2>
+          <div class="table-wrap">
+            <table id="load-intervals">
+              <thead>
+                <tr><th>回路</th><th>超载区间（秒，[含 / (不含）</th><th>数量</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p id="load-no-over" class="muted" hidden>时窗内没有任何回路严格超出容量。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ 调光记录 ============================ -->
+    <section id="tab-records" class="tab-panel">
+      <div class="card">
+        <h2>建立临时调光记录</h2>
+        <p class="muted">
+          针对<strong>已发布版本</strong>建立独立的临时调光记录。记录一经建立即绑定该版本快照：
+          原版 Cue 仍按既有规则在后台运行，之后修改草稿或发布新版本都不会改变本记录。
+          跳转或刷新页面后，将依据快照与操作序列<strong>重算</strong>任意时刻的逐灯实际输出。
+        </p>
+        <form id="form-record-create" class="inline-form">
+          <select id="rec-version" required style="min-width:16rem"></select>
+          <input type="text" id="rec-label" placeholder="记录备注（可留空）" />
+          <button class="primary" type="submit">➕ 建立调光记录</button>
+        </form>
+        <div id="record-create-error" class="error-line" hidden></div>
+
+        <h3>已有记录</h3>
+        <div class="table-wrap">
+          <table id="record-table">
+            <thead><tr><th>#</th><th>备注</th><th>绑定版本</th><th>修订号</th><th>操作数</th><th>建立时间</th><th>操作</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="record-workspace" hidden>
+        <div class="card">
+          <h2 id="rec-title">记录详情</h2>
+          <p class="muted" id="rec-meta"></p>
+          <h3>追加操作（覆盖 / 归还）</h3>
+          <p class="muted">
+            按演出时码追加指定灯具的操作。<strong>覆盖</strong>从操作瞬间的实际输出线性渐变到 0～100 目标亮度，此后保持；
+            <strong>归还</strong>以操作瞬间实际输出为起点，在时长内按进度与持续变化的原版亮度线性融合，结束后完全跟随原版；
+            0 秒操作立即生效，下一操作可接管未完成的渐变。时码不得早于上一条操作，同秒按追加顺序生效。
+          </p>
+          <form id="form-op" class="cue-form">
+            <label>灯具
+              <select id="op-light" required></select>
+            </label>
+            <label>时码 (s) <input type="number" id="op-time" min="0" step="0.1" value="0" required /></label>
+            <label>类型
+              <select id="op-type">
+                <option value="override">覆盖 override</option>
+                <option value="return">归还 return</option>
+              </select>
+            </label>
+            <label>目标亮度（仅覆盖） <input type="number" id="op-target" min="0" max="100" step="0.1" value="80" /></label>
+            <label>时长 (s) <input type="number" id="op-duration" min="0" step="0.1" value="2" required /></label>
+            <button class="primary" type="submit">追加操作</button>
+          </form>
+          <div id="op-error" class="error-line" hidden></div>
+        </div>
+
+        <div class="card">
+          <h2>任意时刻逐灯实际输出</h2>
+          <div class="row transport">
+            <label class="jump">查看时刻
+              <input id="rec-time" type="number" min="0" step="0.1" style="width:6rem" /> 秒
+            </label>
+            <button id="btn-rec-jump">跳转</button>
+            <span class="muted">基于绑定快照与全部操作序列重算；原版在后台继续运行。</span>
+          </div>
+          <div class="row">
+            <input id="rec-timeline" type="range" min="0" max="0" step="0.01" value="0" style="flex:1" />
+          </div>
+          <div class="table-wrap">
+            <table id="rec-levels">
+              <thead>
+                <tr><th>灯具</th><th>原版亮度</th><th>实际输出</th><th>状态</th><th>亮度条</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>操作序列（同秒按追加顺序生效）</h2>
+          <div class="table-wrap">
+            <table id="op-table">
+              <thead>
+                <tr><th>序号</th><th>灯具</th><th>时码(s)</th><th>类型</th><th>目标亮度</th><th>时长(s)</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ 灯具 ============================ -->
+    <section id="tab-lights" class="tab-panel">
+      <div class="card">
+        <h2>录入灯具</h2>
+        <form id="form-light" class="inline-form">
+          <input type="text" id="light-name" placeholder="灯具名称，如：面光 1、侧光 L" required />
+          <button class="primary" type="submit">添加灯具</button>
+        </form>
+        <div id="light-error" class="error-line" hidden></div>
+        <div class="table-wrap">
+          <table id="light-table">
+            <thead><tr><th>编号</th><th>名称</th><th>所属回路</th><th>额定瓦数 (W)</th><th>操作</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>灯光回路</h2>
+        <p class="muted">
+          回路容量为<strong>正数瓦数</strong>。把灯具分配到回路并登记<strong>正数额定瓦数</strong>后，
+          发布版本时一并冻结；<strong>未分配回路</strong>的灯具不计入任何回路负载。
+          容量/瓦数/回路引用非法时会明确拒绝且不保存。
+        </p>
+        <form id="form-circuit" class="inline-form">
+          <input type="text" id="circuit-name" placeholder="回路名称，如：面光回路、侧光回路" required />
+          <input type="number" id="circuit-capacity" min="0" step="1" placeholder="容量（瓦，正数）" style="max-width:11rem" required />
+          <button class="primary" type="submit">添加回路</button>
+        </form>
+        <div id="circuit-error" class="error-line" hidden></div>
+        <div class="table-wrap">
+          <table id="circuit-table">
+            <thead><tr><th>编号</th><th>名称</th><th>容量 (W)</th><th>灯具数</th><th>操作</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ 草稿 Cue ============================ -->
+    <section id="tab-cues" class="tab-panel">
+      <div class="card">
+        <h2>新增草稿 Cue</h2>
+        <p class="muted">
+          时码与渐变时长均为非负秒数（可小数）；目标亮度 0～100；渐变 0 秒为瞬变。
+          Cue 编号可留空自动分配，同秒触发按编号从小到大依次生效。
+        </p>
+        <form id="form-cue" class="cue-form">
+          <label>Cue 编号 <input type="number" id="cue-no" min="1" step="1" placeholder="自动" /></label>
+          <label>灯具
+            <select id="cue-light" required></select>
+          </label>
+          <label>触发秒数 <input type="number" id="cue-time" min="0" step="0.1" value="0" required /></label>
+          <label>目标亮度 <input type="number" id="cue-target" min="0" max="100" step="0.1" value="100" required /></label>
+          <label>渐变秒数 <input type="number" id="cue-duration" min="0" step="0.1" value="0" required /></label>
+          <button class="primary" type="submit">添加 Cue</button>
+        </form>
+        <div id="cue-error" class="error-line" hidden></div>
+
+        <h3>批量录入</h3>
+        <p class="muted">每行一条：<code>时码 灯具编号 目标亮度 渐变时长 [Cue编号]</code>，空格分隔；任一行非法将拒绝整次提交。</p>
+        <textarea id="cue-bulk" rows="4" placeholder="例如：
+2 1 100 3
+2 2 80 3
+5 1 0 2"></textarea>
+        <div class="row"><button id="btn-bulk">批量提交</button></div>
+        <div id="bulk-error" class="error-line" hidden></div>
+
+        <h3>草稿 Cue 列表（编辑仅影响草稿，不动已发布版本）</h3>
+        <div class="table-wrap">
+          <table id="cue-table">
+            <thead>
+              <tr><th>Cue 编号</th><th>灯具</th><th>触发(s)</th><th>目标亮度</th><th>渐变(s)</th><th>操作</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ 发布 ============================ -->
+    <section id="tab-publish" class="tab-panel">
+      <div class="card">
+        <h2>发布演出版本</h2>
+        <p class="muted">
+          发布将对当前全部灯具与草稿 Cue 做完整快照，生成<strong>不可变</strong>版本。
+          之后无论怎样修改草稿，排演播放始终使用开始播放时所选版本的内容。
+        </p>
+        <form id="form-publish" class="inline-form">
+          <input type="text" id="version-label" placeholder="版本备注（可留空）" />
+          <button class="primary" type="submit">📸 冻结并发布当前草稿</button>
+        </form>
+        <div id="publish-error" class="error-line" hidden></div>
+        <h3>已发布版本</h3>
+        <div class="table-wrap">
+          <table id="version-table">
+            <thead><tr><th>#</th><th>备注</th><th>发布时间</th><th>Cue 数</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+    <!-- ============================ 版本合并 ============================ -->
+    <section id="tab-merge" class="tab-panel">
+      <div class="card">
+        <h2>把另一已发布版本合入当前草稿（三方合并）</h2>
+        <p class="muted">
+          两组排演人员从<strong>同一已发布版本</strong>分别改稿：选择当时的<strong>共同基线版本</strong>
+          与另一组发布的<strong>待合入版本</strong>，系统按<strong>灯具/回路编号、Cue 编号、灯具接线</strong>
+          做三方比较并给出预览（<strong>预览不写库</strong>）。仅一侧改动或两侧改成相同内容会
+          <strong>自动合入</strong>；两侧不同改动、删除与修改并存、同编号新增异值、名称重名、
+          Cue/接线引用缺失均列为<strong>冲突</strong>，可逐项选择<strong>保留草稿</strong>或
+          <strong>采用待合入版本</strong>。提交后若仍违反唯一性或引用规则将<strong>整次拒绝</strong>；
+          预览后草稿若被编辑，会返回冲突并要求重新预览。成功后一次事务更新灯具、回路、接线和 Cue；
+          已发布版本及绑定的调光记录均不变。
+        </p>
+        <form id="form-merge-preview" class="inline-form">
+          <label>共同基线版本
+            <select id="merge-base" required style="min-width:16rem"></select>
+          </label>
+          <label>待合入版本
+            <select id="merge-incoming" required style="min-width:16rem"></select>
+          </label>
+          <button class="primary" type="submit">🔍 三方比较预览</button>
+        </form>
+        <div id="merge-error" class="error-line" hidden></div>
+      </div>
+
+      <div id="merge-workspace" hidden>
+        <div class="card">
+          <h2 id="merge-title">合并预览</h2>
+          <p class="muted" id="merge-meta"></p>
+          <h3>可自动合入的改动</h3>
+          <p class="muted">下列改动只发生在待合入版本一侧（或两侧已改成相同内容），提交时自动生效。</p>
+          <div class="table-wrap">
+            <table id="merge-auto-table">
+              <thead>
+                <tr><th>项目</th><th>动作</th><th>基线值</th><th>当前草稿</th><th>待合入版本</th><th>合入后</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p id="merge-no-auto" class="muted" hidden>没有需要自动合入的单侧改动。</p>
+        </div>
+
+        <div class="card">
+          <h3>冲突（须逐项选择）</h3>
+          <p class="muted">每条冲突选择一侧取值；若某一侧取值会导致重名或引用缺失，该侧下方会明确标注。</p>
+          <div id="merge-conflicts"></div>
+          <p id="merge-no-conflict" class="muted" hidden>没有冲突，可以直接提交。</p>
+        </div>
+
+        <div class="card">
+          <div class="row">
+            <button id="btn-merge-commit" class="primary">✅ 按上述抉择提交合并（一次事务）</button>
+            <span class="muted">提交后以新草稿替换当前灯具、回路、接线与 Cue；已发布版本与调光记录不变。</span>
+          </div>
+          <div id="merge-commit-error" class="error-line" hidden></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/engine.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

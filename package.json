@@ -1,0 +1,17 @@
+{
+  "name": "lighting-cue-rehearsal",
+  "version": "1.0.0",
+  "description": "小剧场灯光 Cue 排演 Web 应用：录入灯具与 Cue，在浏览器模拟线性渐变灯光，发布不可变演出版本。",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "express": "^4.21.2"
+  }
+}
