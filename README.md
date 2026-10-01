@@ -11,6 +11,9 @@
 排演人员还可基于一个已发布版本创建**共享房间**：创建者取得控制密钥，其他人凭 6 位房间码
 观看同一舞台与逐灯亮度；服务端按挂钟时间推算当前时码、到版本末尾自动停住，页面刷新、
 服务重启或观看者重连后均能恢复房间进度，后续草稿修改与新版本发布不影响已建房间。
+排演结束后，持**控制密钥**者还可对房间做**复盘**：查询房间自创建起留存的全部生效事件
+（播放、暂停、跳转、改速、到末尾自动停住、关闭），以及留存区间内任一点的播放状态与
+逐灯亮度；复盘只使用建房时固定的版本快照，房间关闭后仍可只读复盘。
 
 技术栈：Node.js + Express + SQLite（better-sqlite3），原生 HTML/CSS/JS 前端，无前端构建步骤。
 
@@ -126,6 +129,32 @@
 
 调用示例见下文「共享房间 HTTP API」。
 
+## 房间复盘（事件流回放与逐灯亮度重放）
+
+排演结束后需要复盘共享房间的实际播放过程。系统自**房间创建**起留存按**服务端时间**排序的
+全部生效事件；**既有房间**自本功能启用时的权威状态开始留存（补一条 `snapshot` 基线事件），
+**不推测更早的操作**。
+
+- **留存事件类型**：`open` 创建、`play` 播放、`pause` 暂停、`seek` 跳转、`speed` 改速、
+  `auto_stop` 到末尾自动停住、`close` 关闭（既有房间还有 `snapshot` 留存起点）。
+- **事件字段**：每条记录生效时刻（服务端挂钟秒）、生效后修订号，以及**操作前后**的时码、
+  播放态、速度、是否停在末尾；**不记录控制密钥**。
+- **排序**：按服务端时间升序；**同一时刻按修订号定序**。
+- **重放规则**：暂停段时码不推进；跳转与改速从**事件边界**接续（改速不跳变）；
+  `auto_stop` 的时刻取**实际到达版本末尾的挂钟时刻**（即使服务稍后才把它落库，时刻仍精确
+  等于 `锚点 +（末尾−基准时码）/速度`）。
+- **只看建房快照**：重放逐灯亮度始终用**建房时固定的版本快照**；页面刷新、服务重启、
+  后续草稿修改或再发布均**不改变复盘结果**。
+- **不留事件的情形**：鉴权失败、非法参数、修订号过期（409）的控制请求**不产生事件**。
+- **关闭语义**：关闭后房间不再可观看或控制（在线接口 404），但房间码与事件流保留，
+  **原控制密钥仍可只读复盘**；关闭时刻为可查询范围的固定终点。
+- **鉴权与越界**：复盘仅对持控制密钥者开放（密钥错误/缺失 → 403）；房间码非法/不存在 →
+  404；查询时间非数字、早于留存起点、（关闭房间）晚于关闭时刻、起止倒置 → 400。
+  在线房间查询**当前之后**的时刻允许按当前播放段**线性外推**（越过末尾则停在末尾），
+  但未来区间内不会有事件。
+
+调用示例见下文「房间复盘 HTTP API」。
+
 ## 一键启动（Docker Compose）
 
 需要 Docker 与 Docker Compose 插件。在本目录执行：
@@ -210,6 +239,12 @@ npm test                  # 运行灯光渐变引擎单元测试
    你（或任何填入密钥者）可用 ▶/⏸/⏹/跳转/0.5×·1×·2× 速度控制房间，所有人同步。
    到版本末尾自动停住；刷新页面、重启服务、掉线重连都能恢复进度；之后改草稿、发新版不影响本房间。
    浏览器地址可保存为 `#room=<房间码>`（观看）或 `#room=<房间码>&roomkey=<密钥>`（带控制）。
+10. **房间复盘**：排演结束后，持控制密钥调用复盘接口（见上文「房间复盘 HTTP API」）：
+    `/replay/events` 列出房间自创建起按服务端时间排序的全部生效事件（含操作前后时码、速度、
+    播放态与修订号，不含密钥；失败与过期修订号的控制不留事件），`/replay/state?at=<挂钟秒>`
+    重放任一点的播放状态与逐灯亮度（暂停段不推进、跳转/改速边界接续、自动停住时刻精确）。
+    复盘始终使用建房时固定的版本快照，刷新、重启、草稿修改与再发布都不改变结果；
+    房间关闭后在线观看与控制不可用，但原密钥仍可只读复盘到关闭时刻。
 
 ## 回路与接线 HTTP API
 
@@ -652,6 +687,122 @@ curl -X DELETE http://localhost:3000/api/rooms/K7QP2M \
 速度不在 0.5/1/2 → 400；缺少修订号或非非负整数 → 400；修订号过期 → 409（房间不变）。
 所有房间接口均不改动版本、草稿与调光记录。
 
+## 房间复盘 HTTP API
+
+复盘接口对**在线房间与已关闭房间**均可用（关闭后仅复盘接口可访问）；均须携带房间创建时
+返回的**控制密钥**（`?key=`、JSON body `{"key}` 或请求头 `X-Room-Key`）。`GET`（query）
+与 `POST`（JSON body）等价。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET/POST | `/api/rooms/:code/replay/events` | 查询挂钟时间区间内留存的生效事件 |
+| GET/POST | `/api/rooms/:code/replay/state` | 查询留存区间内任一点的播放状态与逐灯亮度 |
+
+### 1) 事件查询
+
+| 参数 | 含义 |
+| --- | --- |
+| `key` | 房间控制密钥（必填；错误/缺失 → 403） |
+| `start` | 起始挂钟秒（可选，默认留存起点；早于留存起点 → 400） |
+| `end` | 结束挂钟秒（可选，默认服务端当前时刻；早于 start → 400） |
+
+在线房间的未来区间可以查询（返回空数组，实际过滤上界见响应 `window.query_end`）；
+关闭房间的区间固定在 `closed_at` 以内，超出 → 400。
+
+```bash
+# 查全部留存事件（从创建起）
+curl 'http://localhost:3000/api/rooms/K7QP2M/replay/events?key=a3f9…'
+
+# 只查某段挂钟时间内的事件
+curl -X POST http://localhost:3000/api/rooms/K7QP2M/replay/events \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"a3f9…","start":1790000000,"end":1790000600}'
+```
+
+返回（节选）：
+
+```json
+{
+  "code": "K7QP2M",
+  "version": {"id": 1, "label": "首演"},
+  "closed": false,
+  "retained_from": 1790847000.12,
+  "closed_at": null,
+  "server_now": 1790847365.2,
+  "window": {"start": 1790847000.12, "end": 1790847365.2, "query_end": 1790847365.2},
+  "events": [
+    {"seq": 1, "kind": "open", "kind_text": "创建", "at": 1790847000.12, "revision": 0,
+     "time_before": 0, "time_after": 0, "playing_before": false, "playing_after": false,
+     "speed_before": 1, "speed_after": 1, "at_end_before": false, "at_end_after": false},
+    {"seq": 2, "kind": "play", "kind_text": "播放", "at": 1790847005.5, "revision": 1,
+     "time_before": 0, "time_after": 0, "playing_before": false, "playing_after": true,
+     "speed_before": 1, "speed_after": 1, "at_end_before": false, "at_end_after": false},
+    {"seq": 3, "kind": "pause", "kind_text": "暂停", "at": 1790847008.7, "revision": 2,
+     "time_before": 3.2, "time_after": 3.2, "playing_before": true, "playing_after": false,
+     "speed_before": 1, "speed_after": 1, "at_end_before": false, "at_end_after": false},
+    {"seq": 4, "kind": "seek", "kind_text": "跳转", "at": 1790847012.0, "revision": 3,
+     "time_before": 3.2, "time_after": 5, "playing_before": false, "playing_after": false,
+     "speed_before": 1, "speed_after": 1, "at_end_before": false, "at_end_after": false},
+    {"seq": 5, "kind": "speed", "kind_text": "改速", "at": 1790847014.0, "revision": 4,
+     "time_before": 5, "time_after": 5, "playing_before": false, "playing_after": false,
+     "speed_before": 1, "speed_after": 2, "at_end_before": false, "at_end_after": false},
+    {"seq": 6, "kind": "auto_stop", "kind_text": "到末尾自动停住", "at": 1790847016.5,
+     "revision": 5, "time_before": 10, "time_after": 10,
+     "playing_before": true, "playing_after": false,
+     "speed_before": 2, "speed_after": 2, "at_end_before": false, "at_end_after": true}
+  ]
+}
+```
+
+- 事件按 `at`（服务端挂钟）升序，同一时刻按 `revision` 升序；事件响应**不含密钥**。
+- 失败的控制、错误密钥的尝试与过期修订号提交都**不会**出现在事件流中。
+
+### 2) 任一点状态与逐灯亮度
+
+| 参数 | 含义 |
+| --- | --- |
+| `key` | 房间控制密钥（必填） |
+| `at` | 要复盘的挂钟秒（可选）：默认在线房间=当前时刻、关闭房间=关闭时刻 |
+
+```bash
+# 复盘某挂钟时刻：返回当时播放状态与该时码下的逐灯亮度（按建房时版本快照）
+curl 'http://localhost:3000/api/rooms/K7QP2M/replay/state?key=a3f9…&at=1790847008'
+
+# 关闭后的房间：不带 at 即复盘关闭瞬间冻结的画面
+curl 'http://localhost:3000/api/rooms/K7QP2M/replay/state?key=a3f9…'
+```
+
+返回（节选）：
+
+```json
+{
+  "code": "K7QP2M",
+  "version": {"id": 1, "label": "首演"},
+  "closed": false,
+  "retained_from": 1790847000.12,
+  "closed_at": null,
+  "server_now": 1790847365.2,
+  "at": 1790847008,
+  "duration": 10,
+  "state": {"time": 2.5, "playing": true, "paused": false, "at_end": false,
+            "speed": 1, "revision": 1, "frozen": false},
+  "levels": [
+    {"light_id": 1, "name": "面光1", "brightness": 25},
+    {"light_id": 2, "name": "侧光L", "brightness": 50}
+  ]
+}
+```
+
+- 暂停段内查询任意时刻：`time` 与逐灯亮度保持暂停瞬间的值（时码不推进）。
+- 跳转/改速事件之后：从事件边界的时码与速度接续重放。
+- 在线房间查询未来时刻：按最近播放段线性外推，越过版本末尾时 `at_end=true`、
+  `playing=false`、时码为 `duration`；关闭房间晚于 `closed_at` 的查询 → 400。
+- 关闭房间的响应 `state.frozen=true`，画面为关闭瞬间冻结值；修订号为关闭时修订号
+  （关闭本身不推进修订号）。
+- 房间码非法/不存在 → 404；密钥缺失/错误 → 403；`at`/`start`/`end` 非数字、
+  早于 `retained_from`、（关闭房间）晚于 `closed_at`、起止倒置 → 400。
+- 复盘全程只读：不改动房间、版本、草稿与调光记录。
+
 ## HTTP API 摘要
 
 | 方法 | 路径 | 说明 |
@@ -685,15 +836,17 @@ curl -X DELETE http://localhost:3000/api/rooms/K7QP2M \
 | GET | `/api/rooms` | 共享房间列表（不含密钥） |
 | GET | `/api/rooms/:code` | 凭房间码获取房间权威状态与固定版本快照（可 `?key=` 校验控制身份） |
 | POST | `/api/rooms/:code/control` | 持密钥播放/暂停/跳转/改速（携带修订号，过期 409 不改房间） |
-| DELETE | `/api/rooms/:code` | 持密钥关闭房间 |
+| DELETE | `/api/rooms/:code` | 持密钥关闭房间（软关闭：不可观看/控制，但持密钥可只读复盘） |
+| GET/POST | `/api/rooms/:code/replay/events` | 持密钥查询时间区间内留存的生效事件（创建/播放/暂停/跳转/改速/自动停住/关闭） |
+| GET/POST | `/api/rooms/:code/replay/state` | 持密钥重放任一点的播放状态与逐灯亮度（建房时版本快照；关闭后仍可用） |
 
 所有错误返回 `400/404/409` 与形如 `{"error": "具体中文原因"}` 的 JSON。
 
 ## 目录结构
 
 ```
-server.js            Express 服务与 API、输入校验、版本快照事务、两版比对、临时调光记录（修订号/追加事务）、回路配置与负载分析、草稿三方合并（预览令牌/一次事务提交）、共享房间（房间码/控制密钥/挂钟推算时码/末尾自动停住/修订号乐观并发）
-src/db.js            SQLite 初始化与表结构（含调光记录、操作序列、回路与版本回路快照表、合并预览令牌表、共享房间表，含旧库迁移）
+server.js            Express 服务与 API、输入校验、版本快照事务、两版比对、临时调光记录（修订号/追加事务）、回路配置与负载分析、草稿三方合并（预览令牌/一次事务提交）、共享房间（房间码/控制密钥/挂钟推算时码/末尾自动停住/修订号乐观并发/软关闭）与房间复盘（生效事件留存/事件区间查询/任一点状态与逐灯亮度重放）
+src/db.js            SQLite 初始化与表结构（含调光记录、操作序列、回路与版本回路快照表、合并预览令牌表、共享房间表与复盘事件表，含旧库迁移：旧房间补 snapshot 留存基线）
 src/merge.js         草稿三方合并纯函数（按灯具/回路/Cue/接线分类自动项与冲突、重名与引用校验、抉择落地）
 public/engine.js     纯函数灯光渐变引擎（浏览器/Node 共用，含线性渐变、中途接管、精确差值区间、覆盖/归还重算、回路负载二次精确求根）
 public/index.html    单页界面（含版本合并页、共享房间页）
@@ -705,6 +858,7 @@ test/override.test.js 覆盖/归还单元测试（渐变起点、同秒顺序、
 test/circuit-load.test.js 回路负载单元测试（线性/二次超载求根、端点包含性、瞬变、多灯加权、未分配、零长度）
 test/merge.test.js   草稿三方合并单元测试（单侧自动合入、两侧异改/删除修改并存/同编号异值、重名、Cue/接线引用缺失、联动冲突、整次拒绝）
 test/rooms.test.js   共享房间端到端测试（真实 HTTP：创建/加入/密钥、播放暂停跳转改速、挂钟推进、末尾自动停住、修订号 409、服务重启恢复、草稿与新版不影响房间、关闭鉴权）
+test/room-replay.test.js 房间复盘端到端测试（事件留存与字段、暂停不推进/边界接续、自动停住实际时刻、过期控制不留事件、事件区间与任一点逐灯亮度、建房快照不变、关闭后只读复盘、重启一致、旧房间 snapshot 迁移基线）
 Dockerfile           镜像构建（依赖、初始化、启动）
 docker-compose.yml   一键编排
 ```

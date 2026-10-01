@@ -1419,12 +1419,138 @@ function roomCompute(row, now) {
   return { playing, time: t, at_end };
 }
 
-// 自动停住落库（读到播放中但已到末尾时）：冻结在末尾、暂停并推进修订号
-function roomAutoStop(row) {
-  db.prepare(
-    `UPDATE rooms SET playing = 0, base_time = ?, speed = speed, anchor_at = ?,
-                      at_end = 1, revision = revision + 1 WHERE id = ?`
-  ).run(row.duration, Date.now() / 1000, row.id);
+// 自动停住落库（读到播放中但已到末尾时）：冻结在末尾、暂停并推进修订号；
+// 同时留存一条 auto_stop 复盘事件，event_at 取【实际到达版本末尾的挂钟时刻】（不是落库时刻）。
+// 参数 now 仅用于判定“是否确实已到末尾”，绝不参与事件时刻：stopAt 完全由锚点/速度/末尾推算。
+function roomAutoStop(row, now = Date.now() / 1000) {
+  const stopAt = row.anchor_at + (row.duration - row.base_time) / row.speed;
+  if (stopAt > now) return; // 尚未真正到末尾（调用方误触发），不落任何状态
+  const tx = db.transaction(() => {
+    const cur = db.prepare('SELECT * FROM rooms WHERE id = ?').get(row.id);
+    if (!cur.playing || cur.at_end) return; // 并发双保险：已停住则不重复落事件
+    const trueStopAt = cur.anchor_at + (cur.duration - cur.base_time) / cur.speed;
+    if (trueStopAt > Date.now() / 1000) return;
+    const info = db
+      .prepare(
+        `UPDATE rooms SET playing = 0, base_time = ?, speed = speed, anchor_at = ?,
+                          at_end = 1, revision = revision + 1
+         WHERE id = ? AND revision = ? AND playing = 1 AND at_end = 0`
+      )
+      .run(cur.duration, trueStopAt, cur.id, cur.revision);
+    if (info.changes === 0) return;
+    const seq = db
+      .prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM room_events WHERE room_id = ?')
+      .get(cur.id).m;
+    db.prepare(
+      `INSERT INTO room_events
+         (room_id, seq, kind, event_at, revision_after,
+          time_before, time_after, playing_before, playing_after,
+          speed_before, speed_after, at_end_before, at_end_after)
+       VALUES (?, ?, 'auto_stop', ?, ?,
+               ?, ?, 1, 0,
+               ?, ?, 0, 1)`
+    ).run(cur.id, seq + 1, trueStopAt, cur.revision + 1, cur.duration, cur.duration, cur.speed, cur.speed);
+  });
+  tx();
+}
+
+// 复盘事件读取：按服务端时间排序，同一时刻按修订号定序（seq 为最终兜底）
+function loadRoomEvents(roomId, { start = null, end = null } = {}) {
+  let sql =
+    `SELECT * FROM room_events WHERE room_id = ?`;
+  const params = [roomId];
+  if (start !== null) {
+    sql += ' AND event_at >= ?';
+    params.push(start);
+  }
+  if (end !== null) {
+    sql += ' AND event_at <= ?';
+    params.push(end);
+  }
+  sql += ' ORDER BY event_at ASC, revision_after ASC, seq ASC';
+  return db.prepare(sql).all(...params);
+}
+
+const ROOM_EVENT_LABELS = {
+  open: '创建',
+  snapshot: '留存起点',
+  play: '播放',
+  pause: '暂停',
+  seek: '跳转',
+  speed: '改速',
+  auto_stop: '到末尾自动停住',
+  close: '关闭',
+};
+
+function presentRoomEvent(row) {
+  return {
+    seq: row.seq,
+    kind: row.kind,
+    kind_text: ROOM_EVENT_LABELS[row.kind] || row.kind,
+    at: round6(row.event_at),
+    revision: row.revision_after,
+    time_before: round6(row.time_before),
+    time_after: round6(row.time_after),
+    playing_before: !!row.playing_before,
+    playing_after: !!row.playing_after,
+    speed_before: row.speed_before,
+    speed_after: row.speed_after,
+    at_end_before: !!row.at_end_before,
+    at_end_after: !!row.at_end_after,
+  };
+}
+
+/**
+ * 复盘纯计算：由留存事件流重算任一挂钟时刻 T 的房间播放状态。
+ * 暂停段时码不推进；跳转/改速从事件边界接续；同一时刻按修订号顺序处理（边界取事件后状态）。
+ * 返回 null 表示 T 早于留存起点（调用方应已拦截）。
+ */
+function replayStateAt(events, duration, at) {
+  if (events.length === 0 || at < events[0].event_at) return null;
+  // 边界态：最近一个 event_at <= T 的事件之后的状态
+  let state = null;
+  for (const e of events) {
+    if (e.event_at <= at + 1e-9) {
+      state = e;
+    } else {
+      break;
+    }
+  }
+  const closed = state && state.kind === 'close';
+  if (closed) {
+    // 关闭事件把房间冻结在关闭瞬间：关闭后不可观看，复盘看到的是冻结画面
+    return {
+      time: state.time_after,
+      playing: false,
+      at_end: !!state.at_end_after,
+      speed: state.speed_after,
+      revision: state.revision_after,
+      closed: true,
+    };
+  }
+  const playing = !!state.playing_after;
+  const atEnd = !!state.at_end_after;
+  let t = state.time_after;
+  let reachedEnd = atEnd;
+  if (playing && !atEnd) {
+    t = state.time_after + state.speed_after * (at - state.event_at);
+    if (t >= duration) {
+      t = duration;
+      reachedEnd = true;
+    } else if (t < 0) {
+      t = 0;
+    }
+  }
+  return {
+    // 外推越过末尾：画面停在末尾；若 auto_stop 事件已落库则由 close 边界/事件本身表达暂停，
+    // 此处对“计算上已到末尾”的点统一给出停住的播放态（与真实自动停住一致）
+    time: t,
+    playing: playing && !reachedEnd,
+    at_end: reachedEnd,
+    speed: state.speed_after,
+    revision: state.revision_after,
+    closed: false,
+  };
 }
 
 function getRoomRow(code) {
@@ -1476,11 +1602,23 @@ app.post('/api/rooms', (req, res) => {
   for (let attempt = 0; attempt < 5; attempt++) {
     code = newRoomCode();
     try {
-      db.prepare(
-        `INSERT INTO rooms
-           (code, control_key, version_id, duration, playing, base_time, speed, anchor_at, at_end, revision, created_at)
-         VALUES (?, ?, ?, ?, 0, 0, 1, ?, ?, 0, ?)`
-      ).run(code, key, versionId, duration, now, duration === 0 ? 1 : 0, now);
+      const createRoom = db.transaction(() => {
+        db.prepare(
+          `INSERT INTO rooms
+             (code, control_key, version_id, duration, playing, base_time, speed, anchor_at, at_end, revision, created_at)
+           VALUES (?, ?, ?, ?, 0, 0, 1, ?, ?, 0, ?)`
+        ).run(code, key, versionId, duration, now, duration === 0 ? 1 : 0, now);
+        const created = getRoomRow(code);
+        // 复盘留存起点：创建事件（操作前后即初始权威状态；不记录密钥）
+        db.prepare(
+          `INSERT INTO room_events
+             (room_id, seq, kind, event_at, revision_after,
+              time_before, time_after, playing_before, playing_after,
+              speed_before, speed_after, at_end_before, at_end_after)
+           VALUES (?, 1, 'open', ?, 0, 0, 0, 0, 0, 1, 1, ?, ?)`
+        ).run(created.id, now, duration === 0 ? 1 : 0, duration === 0 ? 1 : 0);
+      });
+      createRoom();
       const row = getRoomRow(code);
       const body = presentRoom(row, { includeKey: true });
       body.version.label = version.label;
@@ -1497,6 +1635,7 @@ app.get('/api/rooms', (req, res) => {
     .prepare(
       `SELECT r.*, v.label AS version_label
        FROM rooms r JOIN versions v ON v.id = r.version_id
+       WHERE r.closed_at IS NULL
        ORDER BY r.id DESC`
     )
     .all();
@@ -1528,7 +1667,9 @@ app.get('/api/rooms/:code', (req, res) => {
     return err(res, 404, `房间码无效：${JSON.stringify(req.params.code)}（须为 6 位房间码）`);
   }
   const row = getRoomRow(code);
-  if (!row) return err(res, 404, `房间不存在：${code}（请向创建者核对房间码）`);
+  if (!row || row.closed_at !== null) {
+    return err(res, 404, `房间不存在：${code}（请向创建者核对房间码；房间关闭后不再可观看）`);
+  }
 
   // 播放中已到末尾：服务端负责把它停住在末尾（修订号 +1）
   if (row.playing && !row.at_end) {
@@ -1571,7 +1712,9 @@ app.post('/api/rooms/:code/control', (req, res) => {
     return err(res, 404, `房间码无效：${JSON.stringify(req.params.code)}（须为 6 位房间码）`);
   }
   const row = getRoomRow(code);
-  if (!row) return err(res, 404, `房间不存在：${code}`);
+  if (!row || row.closed_at !== null) {
+    return err(res, 404, `房间不存在或已关闭：${code}（关闭后的房间不可再控制，仅可持密钥只读复盘）`);
+  }
 
   const key = typeof req.body?.key === 'string' ? req.body.key : '';
   if (!key || key !== row.control_key) {
@@ -1653,15 +1796,50 @@ app.post('/api/rooms/:code/control', (req, res) => {
     speed = [0.5, 1, 2].find((x) => Math.abs(x - s) < 1e-9); // 规范存储值，避免浮点字面量差异
   }
 
-  // 乐观更新：修订号 CAS，杜绝并发请求互相覆盖（同步驱动下为双保险）
-  const info = db
-    .prepare(
-      `UPDATE rooms
-       SET playing = ?, base_time = ?, speed = ?, anchor_at = ?, at_end = ?, revision = revision + 1
-       WHERE id = ? AND revision = ?`
-    )
-    .run(playing, base, speed, now, atEnd, cur.id, clientRev);
-  if (info.changes === 0) {
+  // 乐观更新：修订号 CAS，杜绝并发请求互相覆盖（同步驱动下为双保险）；
+  // 成功后同时留存一条复盘事件（失败/修订号过期的控制不落事件）。
+  const before = {
+    time: computed.time, // 操作前时码 = 边界处由权威状态推算出的当前时码（seek 时与目标不同）
+    playing: computed.playing ? 1 : 0,
+    speed: cur.speed,
+    at_end: computed.at_end ? 1 : 0,
+  };
+  let casChanges = 0;
+  const applyControl = db.transaction(() => {
+    casChanges = db
+      .prepare(
+        `UPDATE rooms
+         SET playing = ?, base_time = ?, speed = ?, anchor_at = ?, at_end = ?, revision = revision + 1
+         WHERE id = ? AND revision = ?`
+      )
+      .run(playing, base, speed, now, atEnd, cur.id, clientRev).changes;
+    if (casChanges === 0) return; // 修订号冲突：整事务回滚，不写事件
+    db.prepare(
+      `INSERT INTO room_events
+         (room_id, seq, kind, event_at, revision_after,
+          time_before, time_after, playing_before, playing_after,
+          speed_before, speed_after, at_end_before, at_end_after)
+       VALUES (?, ?, ?, ?, ?,
+               ?, ?, ?, ?,
+               ?, ?, ?, ?)`
+    ).run(
+      cur.id,
+      db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM room_events WHERE room_id = ?').get(cur.id).m + 1,
+      action,
+      now,
+      clientRev + 1,
+      before.time,
+      base,
+      before.playing,
+      playing,
+      before.speed,
+      speed,
+      before.at_end,
+      atEnd
+    );
+  });
+  applyControl();
+  if (casChanges === 0) {
     const latest = getRoomRow(code);
     return err(
       res,
@@ -1673,7 +1851,9 @@ app.post('/api/rooms/:code/control', (req, res) => {
   res.json(presentRoom(getRoomRow(code)));
 });
 
-// 关闭房间（持密钥者；DELETE 不通用浏览器表单，密钥可放 JSON body 或 ?key=）
+// 关闭房间（持密钥者；DELETE 不通用浏览器表单，密钥可放 JSON body 或 ?key=）。
+// 关闭为软关闭：房间不再可观看或控制（所有在线接口 404），但房间码与留存事件保留，
+// 原控制密钥仍可只读复盘（/api/rooms/:code/replay/*）。
 app.delete('/api/rooms/:code', (req, res) => {
   const code = normRoomCode(req.params.code);
   if (!ROOM_CODE_RE.test(code)) {
@@ -1687,9 +1867,233 @@ app.delete('/api/rooms/:code', (req, res) => {
   if (!key || key !== row.control_key) {
     return err(res, 403, '控制密钥无效或缺失：只有房间创建者（持密钥者）可以关闭房间');
   }
-  db.prepare('DELETE FROM rooms WHERE id = ?').run(row.id);
+  if (row.closed_at !== null) {
+    // 已关闭：重复关闭保持幂等的 404 语义
+    return err(res, 404, `房间已关闭：${code}（仅可持密钥只读复盘）`);
+  }
+
+  const now = Date.now() / 1000;
+  db.transaction(() => {
+    let cur = db.prepare('SELECT * FROM rooms WHERE id = ?').get(row.id);
+    // 关闭前若播放中已到末尾：先按实际到末尾时刻落 auto_stop，再关闭
+    if (cur.playing && !cur.at_end && roomCompute(cur, now).at_end) {
+      roomAutoStop(cur, now);
+      cur = db.prepare('SELECT * FROM rooms WHERE id = ?').get(row.id);
+    }
+    const computed = roomCompute(cur, now);
+    // 关闭瞬间冻结画面：播放中的房间把当前时码固定下来、置为暂停（close 事件记录冻结前后状态）
+    db.prepare(
+      `UPDATE rooms SET playing = 0, base_time = ?, anchor_at = ?, closed_at = ? WHERE id = ?`
+    ).run(computed.time, now, now, cur.id);
+    const seq = db
+      .prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM room_events WHERE room_id = ?')
+      .get(cur.id).m;
+    db.prepare(
+      `INSERT INTO room_events
+         (room_id, seq, kind, event_at, revision_after,
+          time_before, time_after, playing_before, playing_after,
+          speed_before, speed_after, at_end_before, at_end_after)
+       VALUES (?, ?, 'close', ?, ?,
+               ?, ?, ?, 0,
+               ?, ?, ?, ?)`
+    ).run(
+      cur.id,
+      seq + 1,
+      now,
+      cur.revision, // 关闭不推进修订号
+      computed.time,
+      computed.time,
+      computed.playing ? 1 : 0,
+      cur.speed,
+      cur.speed,
+      computed.at_end ? 1 : 0,
+      computed.at_end ? 1 : 0
+    );
+  })();
   res.status(204).end();
 });
+
+/* --------------------- 共享房间复盘（持密钥只读，关闭后仍可用） --------------------- */
+// 复盘只使用建房时固定的版本快照：刷新、重启、后续草稿修改或再发布均不改变结果。
+// 留存事件自房间创建（既有房间自功能启用时的 snapshot 基线）起，按服务端时间排序、
+// 同刻按修订号定序；失败与修订号过期的控制不留事件。
+// 在线房间与已关闭房间均可由持密钥者复盘；错误密钥 403，非法/越界时间 400，房间不存在 404。
+
+function loadRoomForReplay(req, res) {
+  const code = normRoomCode(req.params.code);
+  if (!ROOM_CODE_RE.test(code)) {
+    return { error: err(res, 404, `房间码无效：${JSON.stringify(req.params.code)}（须为 6 位房间码）`) };
+  }
+  const row = getRoomRow(code);
+  if (!row) return { error: err(res, 404, `房间不存在：${code}`) };
+  const input = { ...req.query, ...(req.body || {}) };
+  const key =
+    (typeof input.key === 'string' && input.key) ||
+    (typeof req.headers['x-room-key'] === 'string' ? req.headers['x-room-key'] : '');
+  if (!key || key !== row.control_key) {
+    return { error: err(res, 403, '控制密钥无效或缺失：房间复盘仅对持控制密钥者开放') };
+  }
+  return { row, code };
+}
+
+// GET/POST /api/rooms/:code/replay/events  查询挂钟时间区间内的留存生效事件
+function handleRoomReplayEvents(req, res) {
+  const loaded = loadRoomForReplay(req, res);
+  if (loaded.error) return;
+  const { row } = loaded;
+  const input = { ...req.query, ...(req.body || {}) };
+
+  const events = loadRoomEvents(row.id);
+  const retainedFrom = events.length > 0 ? events[0].event_at : row.created_at;
+  const now = Date.now() / 1000;
+
+  // 在线房间若播放中已到末尾：复盘前先把 auto_stop 按实际到末尾时刻落库（只读查询也需完整事件流）
+  if (row.closed_at === null && row.playing && !row.at_end && roomCompute(row, now).at_end) {
+    roomAutoStop(row, now);
+    return handleRoomReplayEvents(req, res);
+  }
+
+  const hasStart = input.start !== undefined && input.start !== '';
+  const hasEnd = input.end !== undefined && input.end !== '';
+  let start = retainedFrom;
+  let reqEnd = now;
+  if (hasStart) {
+    start = toNum(input.start);
+    if (Number.isNaN(start)) {
+      return err(res, 400, `起始时间无效：${JSON.stringify(input.start)}（须为服务端挂钟秒数）`);
+    }
+    if (start < retainedFrom - 1e-9) {
+      return err(
+        res,
+        400,
+        `起始时间 ${start} 早于房间留存起点 ${round6(retainedFrom)}：留存之前的操作不做推测`
+      );
+    }
+  }
+  if (hasEnd) {
+    reqEnd = toNum(input.end);
+    if (Number.isNaN(reqEnd)) {
+      return err(res, 400, `结束时间无效：${JSON.stringify(input.end)}（须为服务端挂钟秒数）`);
+    }
+    if (reqEnd < start - 1e-9) {
+      return err(res, 400, `结束时间 ${reqEnd} 不能早于起始时间 ${start}`);
+    }
+  }
+  if (row.closed_at !== null) {
+    // 关闭房间：范围固定在关闭时刻以内
+    if (start > row.closed_at + 1e-9) {
+      return err(
+        res,
+        400,
+        `起始时间 ${start} 超出可查询范围：房间已于 ${round6(row.closed_at)} 关闭`
+      );
+    }
+    reqEnd = Math.min(reqEnd, row.closed_at);
+  }
+  // 在线房间未来区间可查但尚无事件：SQL 过滤夹到当前时刻（关闭房间已夹到关闭时刻）
+  const queryEnd = row.closed_at !== null ? reqEnd : Math.min(reqEnd, now);
+
+  const picked = loadRoomEvents(row.id, { start, end: queryEnd });
+  const snap = loadVersionSnapshot(row.version_id);
+  res.json({
+    code: row.code,
+    version: { id: snap.id, label: snap.label },
+    closed: row.closed_at !== null,
+    retained_from: round6(retainedFrom),
+    closed_at: row.closed_at !== null ? round6(row.closed_at) : null,
+    server_now: round6(now),
+    // 回显请求的查询窗口；query_end 为实际 SQL 过滤上界（在线房间截到当前、关闭房间截到关闭）
+    window: { start: round6(start), end: round6(reqEnd), query_end: round6(queryEnd) },
+    events: picked.map(presentRoomEvent),
+  });
+}
+
+app.get('/api/rooms/:code/replay/events', handleRoomReplayEvents);
+app.post('/api/rooms/:code/replay/events', handleRoomReplayEvents);
+
+// GET/POST /api/rooms/:code/replay/state  留存区间内任一点的播放状态与逐灯亮度（按建房时版本快照）
+function handleRoomReplayState(req, res) {
+  const loaded = loadRoomForReplay(req, res);
+  if (loaded.error) return;
+  const { row } = loaded;
+  const input = { ...req.query, ...(req.body || {}) };
+
+  const now = Date.now() / 1000;
+  // 在线房间查询前先物化 auto_stop（与事件接口一致），保证事件流完整
+  if (row.closed_at === null && row.playing && !row.at_end && roomCompute(row, now).at_end) {
+    roomAutoStop(row, now);
+    return handleRoomReplayState(req, res);
+  }
+
+  // 在线房间：播放中的未来时刻允许按当前速度线性外推（该区间不会出现新的真实事件），
+  // 自动停住仍按 duration 精确截断；关闭房间范围固定（closed_at 之后拒绝）。
+  const allEvents = loadRoomEvents(row.id);
+  const retainedFrom = allEvents.length > 0 ? allEvents[0].event_at : row.created_at;
+
+  // at 缺省：在线房间=当前挂钟；关闭房间=关闭时刻
+  let at;
+  if (input.at === undefined || input.at === '') {
+    at = row.closed_at ?? now;
+  } else {
+    at = toNum(input.at);
+    if (Number.isNaN(at)) {
+      return err(res, 400, `查询时刻无效：${JSON.stringify(input.at)}（须为服务端挂钟秒数）`);
+    }
+  }
+  if (at < retainedFrom - 1e-9) {
+    return err(
+      res,
+      400,
+      `查询时刻 ${at} 早于房间留存起点 ${round6(retainedFrom)}：留存之前的状态不做推测`
+    );
+  }
+  if (row.closed_at !== null && at > row.closed_at + 1e-9) {
+    return err(
+      res,
+      400,
+      `查询时刻 ${at} 超出可查询范围：房间已于 ${round6(row.closed_at)} 关闭，关闭之后无状态可查`
+    );
+  }
+
+  const state = replayStateAt(allEvents, row.duration, at);
+  if (!state) {
+    return err(res, 400, `查询时刻 ${at} 早于房间留存起点 ${round6(retainedFrom)}`);
+  }
+
+  // 逐灯亮度：始终用建房时固定的版本快照重算；暂停段时码不推进，亮度自然冻结
+  const snap = loadVersionSnapshot(row.version_id);
+  const baseCues = Engine.prepareCues(snap.cues);
+  const t = Math.min(Math.max(state.time, 0), row.duration);
+  const levels = snap.lights.map((l) => ({
+    light_id: l.id,
+    name: l.name,
+    brightness: round6(Engine.brightnessAt(baseCues, l.id, t)),
+  }));
+
+  res.json({
+    code: row.code,
+    version: { id: snap.id, label: snap.label },
+    closed: row.closed_at !== null,
+    retained_from: round6(retainedFrom),
+    closed_at: row.closed_at !== null ? round6(row.closed_at) : null,
+    server_now: round6(now),
+    at: round6(at),
+    state: {
+      time: round6(t),
+      playing: state.playing,
+      paused: !state.playing,
+      at_end: state.at_end,
+      speed: state.speed,
+      revision: state.revision,
+      frozen: state.closed, // 房间已关闭：复盘返回的是关闭瞬间冻结的画面
+    },
+    duration: round6(row.duration),
+    levels,
+  });
+}
+
+app.get('/api/rooms/:code/replay/state', handleRoomReplayState);
+app.post('/api/rooms/:code/replay/state', handleRoomReplayState);
 
 /* ------------------------------- 错误处理 ------------------------------ */
 

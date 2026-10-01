@@ -118,8 +118,32 @@ CREATE TABLE IF NOT EXISTS rooms (
   anchor_at   REAL NOT NULL,              -- 状态写入时的服务器挂钟秒数（Date.now()/1000，重启后仍可推算）
   at_end      INTEGER NOT NULL DEFAULT 0, -- 是否已到版本末尾自动停住
   revision    INTEGER NOT NULL DEFAULT 0, -- 修订号：每次成功控制（含自动停住）+1，控制请求乐观并发
-  created_at  REAL NOT NULL
+  created_at  REAL NOT NULL,
+  closed_at   REAL                          -- 关闭时刻（挂钟秒）：NULL=开放中；关闭后不可观看/控制，但持密钥可只读复盘
 );
+
+-- 房间复盘事件流：自房间创建（既有房间自复盘功能启用时的权威状态）起留存的全部生效事件，
+-- 按服务端挂钟排序；同一时刻按修订号定序。只记录播放态/时码/速度/修订号，不记录控制密钥。
+-- 失败的控制与修订号过期的控制不产生事件。
+CREATE TABLE IF NOT EXISTS room_events (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id        INTEGER NOT NULL REFERENCES rooms(id),
+  seq            INTEGER NOT NULL,          -- 房间内事件序号（追加顺序）
+  kind           TEXT NOT NULL,             -- open 创建 / snapshot 留存起点（迁移基线）/ play / pause / seek / speed / auto_stop / close
+  event_at       REAL NOT NULL,             -- 生效时刻（服务端挂钟秒；auto_stop 为实际到达末尾的时刻）
+  revision_after INTEGER NOT NULL,          -- 该事件生效后的房间修订号（同时刻按它定序）
+  time_before    REAL NOT NULL,             -- 事件前时码（演出秒）
+  time_after     REAL NOT NULL,             -- 事件后时码（跳转/改速/暂停均从该边界接续）
+  playing_before INTEGER NOT NULL,          -- 事件前播放态：1=播放中 0=暂停
+  playing_after  INTEGER NOT NULL,
+  speed_before   REAL NOT NULL,
+  speed_after    REAL NOT NULL,
+  at_end_before  INTEGER NOT NULL DEFAULT 0,
+  at_end_after   INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (room_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_room_events ON room_events (room_id, event_at, revision_after);
 
 -- 草稿合并预览令牌：预览不写库，提交时凭令牌校验抉择并确认草稿未被改动
 CREATE TABLE IF NOT EXISTS merge_previews (
@@ -144,6 +168,70 @@ function migrate(database) {
   }
   if (!cols.includes('watts')) {
     database.exec('ALTER TABLE lights ADD COLUMN watts REAL');
+  }
+
+  // 房间复盘功能启用：旧 rooms 表补关闭时刻列；room_events 由建表语句保证存在。
+  const roomCols = database.prepare('PRAGMA table_info(rooms)').all().map((c) => c.name);
+  if (!roomCols.includes('closed_at')) {
+    database.exec('ALTER TABLE rooms ADD COLUMN closed_at REAL');
+  }
+
+  // 既有房间从功能启用时的权威状态开始留存（不推测更早操作）：
+  // 为尚无任何事件的房间补一条 snapshot 基线事件，内容为当前权威状态。
+  const migratedAt = Date.now() / 1000;
+  const legacyRooms = database
+    .prepare(
+      `SELECT r.* FROM rooms r
+       WHERE NOT EXISTS (SELECT 1 FROM room_events e WHERE e.room_id = r.id)`
+    )
+    .all();
+  if (legacyRooms.length > 0) {
+    const maxSeq = database.prepare(
+      'SELECT COALESCE(MAX(seq), 0) AS m FROM room_events WHERE room_id = ?'
+    );
+    const ins = database.prepare(
+      `INSERT INTO room_events
+         (room_id, seq, kind, event_at, revision_after,
+          time_before, time_after, playing_before, playing_after,
+          speed_before, speed_after, at_end_before, at_end_after)
+       VALUES (?, ?, 'snapshot', ?, ?,
+               ?, ?, ?, ?,
+               ?, ?, ?, ?)`
+    );
+    const bumpRevision = database.prepare(
+      'UPDATE rooms SET revision = revision + 1, playing = 0, at_end = 1, base_time = duration, anchor_at = ? WHERE id = ?'
+    );
+    const tx = database.transaction(() => {
+      for (const r of legacyRooms) {
+        // 播放中若已越过版本末尾：在启用时刻即落为末尾停住（不补造历史 auto_stop），
+        // 基线 snapshot 记录“启用时已停在末尾”的权威状态，修订号按自动停住语义 +1。
+        let row = r;
+        if (
+          r.playing &&
+          !r.at_end &&
+          r.base_time + r.speed * (migratedAt - r.anchor_at) >= r.duration
+        ) {
+          bumpRevision.run(migratedAt, r.id);
+          row = database.prepare('SELECT * FROM rooms WHERE id = ?').get(r.id);
+        }
+        const seq = maxSeq.get(row.id).m;
+        ins.run(
+          row.id,
+          seq + 1,
+          migratedAt,
+          row.revision,
+          row.base_time,
+          row.base_time,
+          row.playing,
+          row.playing,
+          row.speed,
+          row.speed,
+          row.at_end,
+          row.at_end
+        );
+      }
+    });
+    tx();
   }
 }
 
