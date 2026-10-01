@@ -6,6 +6,7 @@ const express = require('express');
 const { open, get } = require('./src/db');
 const Engine = require('./public/engine');
 const Merge = require('./src/merge');
+const Replay = require('./src/replay');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'app.db');
@@ -1419,12 +1420,100 @@ function roomCompute(row, now) {
   return { playing, time: t, at_end };
 }
 
-// 自动停住落库（读到播放中但已到末尾时）：冻结在末尾、暂停并推进修订号
-function roomAutoStop(row) {
+// 追加一条房间生效事件（须在事务内调用）。事件含操作前后时码、速度、播放态与修订号，
+// 不记录控制密钥；同一时刻的多条事件由 revision_after 定序。
+function appendRoomEvent(roomId, ev) {
+  const maxSeq = db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM room_events WHERE room_id = ?').get(roomId).m;
   db.prepare(
-    `UPDATE rooms SET playing = 0, base_time = ?, speed = speed, anchor_at = ?,
-                      at_end = 1, revision = revision + 1 WHERE id = ?`
-  ).run(row.duration, Date.now() / 1000, row.id);
+    `INSERT INTO room_events
+       (room_id, seq, type, at_server, revision_after,
+        before_time, after_time, before_playing, after_playing,
+        before_speed, after_speed, before_revision, after_revision)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    roomId,
+    maxSeq + 1,
+    ev.type,
+    ev.at_server,
+    ev.after_revision,
+    ev.before_time ?? null,
+    ev.after_time ?? null,
+    ev.before_playing === null || ev.before_playing === undefined ? null : ev.before_playing ? 1 : 0,
+    ev.after_playing === null || ev.after_playing === undefined ? null : ev.after_playing ? 1 : 0,
+    ev.before_speed ?? null,
+    ev.after_speed ?? null,
+    ev.before_revision ?? null,
+    ev.after_revision
+  );
+}
+
+// 自动停住落库（读到播放中但已到末尾时）：冻结在末尾、暂停并推进修订号，
+// 同时留存一条 auto_stop 事件——其生效时刻取“到达版本末尾的实际挂钟时刻”，
+// 操作前为播放中、操作后停在末尾；同一时刻由递增后的修订号排在播放事件之后。
+function materializeAutoStop(row) {
+  const stopAt = row.anchor_at + (row.duration - row.base_time) / row.speed;
+  let changed = 0;
+  const tx = db.transaction(() => {
+    const info = db
+      .prepare(
+        `UPDATE rooms
+         SET playing = 0, base_time = ?, speed = speed, anchor_at = ?,
+             at_end = 1, revision = revision + 1
+         WHERE id = ? AND playing = 1 AND at_end = 0`
+      )
+      .run(row.duration, stopAt, row.id);
+    changed = info.changes;
+    if (changed === 0) return;
+    const fresh = db.prepare('SELECT * FROM rooms WHERE id = ?').get(row.id);
+    appendRoomEvent(row.id, {
+      type: 'auto_stop',
+      at_server: stopAt,
+      before_time: row.duration,
+      after_time: row.duration,
+      before_playing: true,
+      after_playing: false,
+      before_speed: row.speed,
+      after_speed: row.speed,
+      before_revision: row.revision,
+      after_revision: fresh.revision,
+    });
+  });
+  tx();
+  return changed > 0;
+}
+
+// 兼容既有调用点：返回是否实际落库
+function roomAutoStop(row) {
+  return materializeAutoStop(row);
+}
+
+// 既有房间在复盘功能启用时从“权威状态”开始留存：不推测更早操作。
+// 对尚无任何事件的房间补一条 snapshot（此刻播放中已越过末尾的，先按读到末尾的
+// 既有语义把自动停住落库，快照即停住后的权威状态）。
+function backfillRoomSnapshots() {
+  const rows = db.prepare('SELECT * FROM rooms ORDER BY id ASC').all();
+  for (const row of rows) {
+    const n = db.prepare('SELECT COUNT(*) AS n FROM room_events WHERE room_id = ?').get(row.id).n;
+    if (n > 0) continue;
+    if (row.playing && !row.at_end && roomCompute(row).at_end) materializeAutoStop(row);
+    const cur = db.prepare('SELECT * FROM rooms WHERE id = ?').get(row.id);
+    const now = Date.now() / 1000;
+    const tx = db.transaction(() => {
+      appendRoomEvent(cur.id, {
+        type: 'snapshot',
+        at_server: now,
+        before_time: null,
+        after_time: cur.base_time,
+        before_playing: null,
+        after_playing: !!cur.playing,
+        before_speed: null,
+        after_speed: cur.speed,
+        before_revision: null,
+        after_revision: cur.revision,
+      });
+    });
+    tx();
+  }
 }
 
 function getRoomRow(code) {
@@ -1476,11 +1565,30 @@ app.post('/api/rooms', (req, res) => {
   for (let attempt = 0; attempt < 5; attempt++) {
     code = newRoomCode();
     try {
-      db.prepare(
-        `INSERT INTO rooms
-           (code, control_key, version_id, duration, playing, base_time, speed, anchor_at, at_end, revision, created_at)
-         VALUES (?, ?, ?, ?, 0, 0, 1, ?, ?, 0, ?)`
-      ).run(code, key, versionId, duration, now, duration === 0 ? 1 : 0, now);
+      const tx = db.transaction(() => {
+        const info = db
+          .prepare(
+            `INSERT INTO rooms
+               (code, control_key, version_id, duration, playing, base_time, speed, anchor_at, at_end, revision, created_at)
+             VALUES (?, ?, ?, ?, 0, 0, 1, ?, ?, 0, ?)`
+          )
+          .run(code, key, versionId, duration, now, duration === 0 ? 1 : 0, now);
+        const roomId = info.lastInsertRowid;
+        // 留存起点：创建事件（修订号 0，状态即创建时的权威状态）
+        appendRoomEvent(roomId, {
+          type: 'create',
+          at_server: now,
+          before_time: null,
+          after_time: 0,
+          before_playing: null,
+          after_playing: false,
+          before_speed: null,
+          after_speed: 1,
+          before_revision: null,
+          after_revision: 0,
+        });
+      });
+      tx();
       const row = getRoomRow(code);
       const body = presentRoom(row, { includeKey: true });
       body.version.label = version.label;
@@ -1497,6 +1605,7 @@ app.get('/api/rooms', (req, res) => {
     .prepare(
       `SELECT r.*, v.label AS version_label
        FROM rooms r JOIN versions v ON v.id = r.version_id
+       WHERE r.closed = 0
        ORDER BY r.id DESC`
     )
     .all();
@@ -1529,8 +1638,11 @@ app.get('/api/rooms/:code', (req, res) => {
   }
   const row = getRoomRow(code);
   if (!row) return err(res, 404, `房间不存在：${code}（请向创建者核对房间码）`);
+  if (row.closed) {
+    return err(res, 404, `房间不存在：${code}（房间已关闭，不可观看；持控制密钥可只读复盘）`);
+  }
 
-  // 播放中已到末尾：服务端负责把它停住在末尾（修订号 +1）
+  // 播放中已到末尾：服务端负责把它停住在末尾（修订号 +1，并留存 auto_stop 事件）
   if (row.playing && !row.at_end) {
     const c = roomCompute(row);
     if (c.at_end) roomAutoStop(row);
@@ -1572,6 +1684,9 @@ app.post('/api/rooms/:code/control', (req, res) => {
   }
   const row = getRoomRow(code);
   if (!row) return err(res, 404, `房间不存在：${code}`);
+  if (row.closed) {
+    return err(res, 404, `房间不存在：${code}（房间已关闭，不再可控制；持控制密钥可只读复盘）`);
+  }
 
   const key = typeof req.body?.key === 'string' ? req.body.key : '';
   if (!key || key !== row.control_key) {
@@ -1653,15 +1768,35 @@ app.post('/api/rooms/:code/control', (req, res) => {
     speed = [0.5, 1, 2].find((x) => Math.abs(x - s) < 1e-9); // 规范存储值，避免浮点字面量差异
   }
 
-  // 乐观更新：修订号 CAS，杜绝并发请求互相覆盖（同步驱动下为双保险）
-  const info = db
-    .prepare(
-      `UPDATE rooms
-       SET playing = ?, base_time = ?, speed = ?, anchor_at = ?, at_end = ?, revision = revision + 1
-       WHERE id = ? AND revision = ?`
-    )
-    .run(playing, base, speed, now, atEnd, cur.id, clientRev);
-  if (info.changes === 0) {
+  // 乐观更新：修订号 CAS + 生效事件落库在同一事务内，杜绝并发请求互相覆盖
+  // （同步驱动下 CAS 为双保险）；失败或修订号过期的控制不产生事件。
+  let casChanged = 0;
+  let newRevision = cur.revision + 1;
+  const applyControl = db.transaction(() => {
+    const info = db
+      .prepare(
+        `UPDATE rooms
+         SET playing = ?, base_time = ?, speed = ?, anchor_at = ?, at_end = ?, revision = revision + 1
+         WHERE id = ? AND revision = ?`
+      )
+      .run(playing, base, speed, now, atEnd, cur.id, clientRev);
+    casChanged = info.changes;
+    if (casChanged === 0) return;
+    appendRoomEvent(cur.id, {
+      type: action,
+      at_server: now,
+      before_time: computed.time,
+      after_time: base,
+      before_playing: computed.playing,
+      after_playing: !!playing,
+      before_speed: cur.speed,
+      after_speed: speed,
+      before_revision: cur.revision,
+      after_revision: newRevision,
+    });
+  });
+  applyControl();
+  if (casChanged === 0) {
     const latest = getRoomRow(code);
     return err(
       res,
@@ -1673,22 +1808,264 @@ app.post('/api/rooms/:code/control', (req, res) => {
   res.json(presentRoom(getRoomRow(code)));
 });
 
-// 关闭房间（持密钥者；DELETE 不通用浏览器表单，密钥可放 JSON body 或 ?key=）
+// 关闭房间（持密钥者；DELETE 不通用浏览器表单，密钥可放 JSON body 或 ?key=）。
+// 关闭后房间不再可观看或控制（直播接口一律 404），但事件留存保留，原密钥可只读复盘。
 app.delete('/api/rooms/:code', (req, res) => {
   const code = normRoomCode(req.params.code);
   if (!ROOM_CODE_RE.test(code)) {
     return err(res, 404, `房间码无效：${JSON.stringify(req.params.code)}（须为 6 位房间码）`);
   }
   const row = getRoomRow(code);
-  if (!row) return err(res, 404, `房间不存在：${code}`);
+  if (!row || row.closed) return err(res, 404, `房间不存在：${code}`);
   const key =
     (typeof req.body?.key === 'string' && req.body.key) ||
     (typeof req.query.key === 'string' ? req.query.key : '');
   if (!key || key !== row.control_key) {
     return err(res, 403, '控制密钥无效或缺失：只有房间创建者（持密钥者）可以关闭房间');
   }
-  db.prepare('DELETE FROM rooms WHERE id = ?').run(row.id);
+
+  const now = Date.now() / 1000;
+  const tx = db.transaction(() => {
+    // 关闭瞬间仍在播放：先把到末尾自动停住按实际时刻留存（若此刻已越过末尾），
+    // 否则关闭事件冻结在当前推算时码（修订号不随关闭推进）。
+    let cur = db.prepare('SELECT * FROM rooms WHERE id = ?').get(row.id);
+    let frozenTime = cur.base_time;
+    let frozenPlaying = !!cur.playing;
+    let frozenSpeed = cur.speed;
+    let frozenRevision = cur.revision;
+    if (cur.playing && !cur.at_end && roomCompute(cur, now).at_end) {
+      materializeAutoStop(cur);
+      cur = db.prepare('SELECT * FROM rooms WHERE id = ?').get(row.id);
+      frozenTime = cur.base_time;
+      frozenPlaying = false;
+      frozenSpeed = cur.speed;
+      frozenRevision = cur.revision;
+    } else if (cur.playing) {
+      frozenTime = cur.base_time + cur.speed * (now - cur.anchor_at);
+    }
+
+    db.prepare(
+      'UPDATE rooms SET closed = 1, closed_at = ? WHERE id = ?'
+    ).run(now, row.id);
+    appendRoomEvent(row.id, {
+      type: 'close',
+      at_server: now,
+      before_time: frozenTime,
+      after_time: frozenTime,
+      before_playing: frozenPlaying,
+      after_playing: false, // 关闭后不可观看：状态冻结为停住
+      before_speed: frozenSpeed,
+      after_speed: frozenSpeed,
+      before_revision: frozenRevision,
+      after_revision: frozenRevision,
+    });
+  });
+  tx();
   res.status(204).end();
+});
+
+/* ----------------- 共享房间复盘（只读事件重放，持控制密钥） ----------------- */
+// 从房间创建（或功能启用时的权威快照）起留存生效事件；查询只使用建房时固定的版本快照，
+// 刷新、重启、草稿修改或新版本发布均不改变复盘结果。错误密钥明确拒绝，非法或越界时间
+// 明确拒绝；失败或修订号过期的控制不留事件。关闭后仍可凭原密钥只读复盘。
+
+const ROOM_EVENT_TYPE_TEXT = {
+  create: '创建',
+  snapshot: '启用时权威快照',
+  play: '播放',
+  pause: '暂停',
+  seek: '跳转',
+  speed: '改速',
+  auto_stop: '到末尾自动停住',
+  close: '关闭',
+};
+
+function loadRoomEvents(roomId) {
+  return Replay.sortEvents(
+    db
+      .prepare(
+        `SELECT * FROM room_events WHERE room_id = ?
+         ORDER BY at_server ASC, revision_after ASC, seq ASC, id ASC`
+      )
+      .all(roomId)
+      .map(Replay.normalizeEvent)
+  );
+}
+
+function presentRoomEvent(ev) {
+  return {
+    seq: ev.seq,
+    type: ev.type,
+    type_text: ROOM_EVENT_TYPE_TEXT[ev.type] || ev.type,
+    at_server: round6(ev.at_server),
+    revision: ev.after_revision,
+    revision_after: ev.after_revision,
+    before:
+      ev.before_time === null
+        ? null
+        : {
+            time: round6(ev.before_time),
+            playing: ev.before_playing,
+            speed: ev.before_speed,
+            revision: ev.before_revision,
+          },
+    after: {
+      time: round6(ev.after_time),
+      playing: ev.after_playing,
+      speed: ev.after_speed,
+      revision: ev.after_revision,
+    },
+  };
+}
+
+// 复盘接口共用：校验房间码/存在性与控制密钥；开放中的房间先把“已到末尾自动停住”落库。
+// 返回 { row, events, startAt } 或通过 res 发送错误（返回 null）。
+function loadReplayRoom(req, res, codeRaw) {
+  const code = normRoomCode(codeRaw);
+  if (!ROOM_CODE_RE.test(code)) {
+    err(res, 404, `房间码无效：${JSON.stringify(codeRaw)}（须为 6 位房间码）`);
+    return null;
+  }
+  const row = getRoomRow(code);
+  if (!row) {
+    err(res, 404, `房间不存在：${code}（请向创建者核对房间码）`);
+    return null;
+  }
+  const key =
+    (typeof req.query.key === 'string' && req.query.key) ||
+    (req.body && typeof req.body.key === 'string' ? req.body.key : '');
+  if (!key || key !== row.control_key) {
+    err(res, 403, '控制密钥无效或缺失：房间复盘仅对持控制密钥者开放（只读）');
+    return null;
+  }
+  if (!row.closed && row.playing && !row.at_end && roomCompute(row).at_end) {
+    materializeAutoStop(row);
+  }
+  const fresh = getRoomRow(code);
+  const events = loadRoomEvents(fresh.id);
+  return { row: fresh, events, startAt: events.length ? events[0].at_server : fresh.created_at };
+}
+
+// GET /api/rooms/:code/replay 复盘概览：留存范围、版本、事件数、关闭状态
+app.get('/api/rooms/:code/replay', (req, res) => {
+  const ctx = loadReplayRoom(req, res, req.params.code);
+  if (!ctx) return;
+  const { row, events, startAt } = ctx;
+  const version = db.prepare('SELECT label FROM versions WHERE id = ?').get(row.version_id);
+  res.json({
+    code: row.code,
+    version: { id: row.version_id, label: version.label },
+    duration: round6(row.duration),
+    closed: !!row.closed,
+    closed_at: row.closed_at ? round6(row.closed_at) : null,
+    retained_from: round6(startAt),
+    retained_until: round6(row.closed_at ?? Date.now() / 1000),
+    event_count: events.length,
+    revision: row.revision,
+    server_now: round6(Date.now() / 1000),
+  });
+});
+
+// GET /api/rooms/:code/replay/events?from=&to= 时间区间内生效事件（按服务端时间、修订号定序）
+app.get('/api/rooms/:code/replay/events', (req, res) => {
+  const ctx = loadReplayRoom(req, res, req.params.code);
+  if (!ctx) return;
+  const { row, events, startAt } = ctx;
+  const endAt = row.closed_at ?? Date.now() / 1000;
+
+  let from = startAt;
+  let to = endAt;
+  if (req.query.from !== undefined) {
+    from = toNum(req.query.from);
+    if (Number.isNaN(from)) return err(res, 400, `区间起点无效：${JSON.stringify(req.query.from)}（须为数字挂钟秒数）`);
+  }
+  if (req.query.to !== undefined) {
+    to = toNum(req.query.to);
+    if (Number.isNaN(to)) return err(res, 400, `区间终点无效：${JSON.stringify(req.query.to)}（须为数字挂钟秒数）`);
+  }
+  if (from > to) {
+    return err(res, 400, `时间区间非法：起点（${from}）不能大于终点（${to}）`);
+  }
+  if (from < startAt - 1e-9) {
+    return err(
+      res,
+      400,
+      `时间越界：起点 ${from} 早于本房间留存起点 ${startAt}（既有房间只从功能启用时的权威状态开始留存，不推测更早操作）`
+    );
+  }
+  if (to > endAt + 1e-9) {
+    return err(
+      res,
+      400,
+      `时间越界：终点 ${to} 晚于可查询终点 ${endAt}（开放房间可查到当前时刻，关闭房间止于关闭时刻）`
+    );
+  }
+
+  const picked = events.filter((ev) => ev.at_server >= from - 1e-9 && ev.at_server <= to + 1e-9);
+  res.json({
+    code: row.code,
+    version: { id: row.version_id },
+    window: { from: round6(from), to: round6(to) },
+    retained_from: round6(startAt),
+    retained_until: round6(endAt),
+    events: picked.map(presentRoomEvent),
+  });
+});
+
+// GET /api/rooms/:code/replay/state?at=<挂钟秒> 任一点的播放状态与逐灯亮度（建房快照重算）
+app.get('/api/rooms/:code/replay/state', (req, res) => {
+  const ctx = loadReplayRoom(req, res, req.params.code);
+  if (!ctx) return;
+  const { row, events, startAt } = ctx;
+  const endAt = row.closed_at ?? Date.now() / 1000;
+
+  const at = toNum(req.query.at);
+  if (Number.isNaN(at)) {
+    return err(res, 400, `查询时刻无效：${JSON.stringify(req.query.at)}（须为数字挂钟秒数）`);
+  }
+  if (at < startAt - 1e-9) {
+    return err(
+      res,
+      400,
+      `查询时刻越界：${at} 早于留存起点 ${startAt}（既有房间只从功能启用时的权威状态开始留存，不推测更早操作）`
+    );
+  }
+  if (at > endAt + 1e-9) {
+    return err(
+      res,
+      400,
+      `查询时刻越界：${at} 晚于可查询终点 ${endAt}（开放房间可查到当前时刻，关闭房间止于关闭时刻）`
+    );
+  }
+
+  const st = Replay.stateAt(events, row.duration, at);
+  // 逐灯亮度只使用建房时固定的版本快照：草稿修改与新版本发布均不影响复盘结果
+  const snap = loadVersionSnapshot(row.version_id);
+  const prepared = Engine.prepareCues(snap.cues);
+  const levels = snap.lights.map((l) => ({
+    light_id: l.id,
+    name: l.name,
+    brightness: round6(Engine.brightnessAt(prepared, l.id, st.time)),
+  }));
+
+  res.json({
+    code: row.code,
+    version: { id: snap.id, label: snap.label },
+    at: round6(at),
+    retained_from: round6(startAt),
+    duration: round6(row.duration),
+    playing: st.playing,
+    paused: st.paused,
+    at_end: st.at_end,
+    closed: st.closed,
+    time: round6(st.time),
+    speed: st.speed,
+    revision: st.revision,
+    governing_event: st.event
+      ? { seq: st.event.seq, type: st.event.type, type_text: ROOM_EVENT_TYPE_TEXT[st.event.type] || st.event.type }
+      : null,
+    levels,
+  });
 });
 
 /* ------------------------------- 错误处理 ------------------------------ */
@@ -1706,6 +2083,9 @@ app.use((e, req, res, next) => {
 app.get(/^(?!\/api\/).*/, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
+
+// 既有房间：从复盘功能启用时的权威状态开始留存事件（不推测更早操作）
+backfillRoomSnapshots();
 
 app.listen(PORT, () => {
   console.log(`小剧场灯光 Cue 排演应用已启动: http://localhost:${PORT}`);

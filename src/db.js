@@ -118,8 +118,33 @@ CREATE TABLE IF NOT EXISTS rooms (
   anchor_at   REAL NOT NULL,              -- 状态写入时的服务器挂钟秒数（Date.now()/1000，重启后仍可推算）
   at_end      INTEGER NOT NULL DEFAULT 0, -- 是否已到版本末尾自动停住
   revision    INTEGER NOT NULL DEFAULT 0, -- 修订号：每次成功控制（含自动停住）+1，控制请求乐观并发
+  closed      INTEGER NOT NULL DEFAULT 0, -- 是否已关闭：关闭后不可观看/控制，但留存事件可凭原密钥只读复盘
+  closed_at   REAL,                       -- 关闭实际时刻（服务端挂钟秒）；未关闭为 NULL
   created_at  REAL NOT NULL
 );
+
+-- 共享房间生效事件流（复盘）：从房间创建（或本功能启用时的权威快照）起留存，
+-- 按服务端挂钟时刻、同一时刻再按修订号（revision_after）定序。
+-- 每项记录操作前后时码、速度、播放态与修订号；不记录控制密钥。
+CREATE TABLE IF NOT EXISTS room_events (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id        INTEGER NOT NULL REFERENCES rooms(id),
+  seq            INTEGER NOT NULL,            -- 房间内留存顺序（含快照/创建/控制/自动停住/关闭）
+  type           TEXT NOT NULL,               -- create/snapshot/play/pause/seek/speed/auto_stop/close
+  at_server      REAL NOT NULL,               -- 事件生效的服务端挂钟秒数（Date.now()/1000）
+  revision_after INTEGER NOT NULL,            -- 事件生效后的房间修订号（同一时刻据此定序）
+  before_time    REAL,                        -- 操作前时码（秒）；创建/启用快照为留存起点状态
+  after_time     REAL,                        -- 操作后时码（秒）
+  before_playing INTEGER,                    -- 操作前播放态（1 播放中 / 0 暂停）
+  after_playing  INTEGER,                    -- 操作后播放态
+  before_speed   REAL,                        -- 操作前速度（0.5 / 1 / 2）
+  after_speed    REAL,                        -- 操作后速度
+  before_revision INTEGER,                   -- 操作前修订号
+  after_revision  INTEGER NOT NULL,
+  UNIQUE (room_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_room_events ON room_events (room_id, at_server, revision_after, id);
 
 -- 草稿合并预览令牌：预览不写库，提交时凭令牌校验抉择并确认草稿未被改动
 CREATE TABLE IF NOT EXISTS merge_previews (
@@ -144,6 +169,14 @@ function migrate(database) {
   }
   if (!cols.includes('watts')) {
     database.exec('ALTER TABLE lights ADD COLUMN watts REAL');
+  }
+  // 复盘功能：rooms 表补充关闭标记（关闭后仅可凭原密钥只读复盘）
+  const roomCols = database.prepare('PRAGMA table_info(rooms)').all().map((c) => c.name);
+  if (roomCols.length > 0 && !roomCols.includes('closed')) {
+    database.exec('ALTER TABLE rooms ADD COLUMN closed INTEGER NOT NULL DEFAULT 0');
+  }
+  if (roomCols.length > 0 && !roomCols.includes('closed_at')) {
+    database.exec('ALTER TABLE rooms ADD COLUMN closed_at REAL');
   }
 }
 
